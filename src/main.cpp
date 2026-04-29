@@ -1,459 +1,184 @@
-#include <Wire.h>
+// ============================================================
+//   SENTINEL BOX - ESP32 UTAMA (Otak)
+//   Sensor  : RFID RC522 + AS608 Fingerprint + Relay
+//   Network : WiFi + MQTT (PubSubClient)
+//   Comms   : UART ke ESP32-CAM (GPIO14 RX / GPIO12 TX)
+//   LCD     : I2C 16x2 (0x27)
+// ============================================================
+
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <WebServer.h>
 #include <PubSubClient.h>
+#include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include <Adafruit_Fingerprint.h>
 #include <SPI.h>
 #include <MFRC522.h>
-#include <HTTPClient.h>
+#include <Adafruit_Fingerprint.h>
 
-// ========== WIFI & MQTT ==========
-const char* ssid        = "Danyep";
-const char* password    = "HiSayang";
-const char* mqtt_server = "294542ce25054f91be349c2b99c45ebc.s1.eu.hivemq.cloud";
-const int   mqtt_port   = 8883;
+// ============================================================
+// KONFIGURASI WiFi & MQTT
+// ============================================================
+const char* ssid        = "SIJABAIK";          // ganti sesuai WiFi kamu
+const char* password    = "SENTINEL";           // ganti sesuai WiFi kamu
+const char* mqtt_server = "10.42.0.32";         // IP broker MQTT
+const int   mqtt_port   = 1883;
 const char* mqtt_user   = "sentinel";
 const char* mqtt_pass   = "Tes12345";
 
-// ========== IP ESP32-CAM ==========
-const char* camIP   = "172.26.245.51"; // <-- ganti IP ESP32-CAM kamu
-const int   camPort = 80;
+// ============================================================
+// PIN MAPPING
+// ============================================================
+// RFID RC522 (SPI)
+#define RST_PIN    4
+#define SS_PIN     5
+// SCK=18, MOSI=23, MISO=19 (otomatis SPI default ESP32)
 
-// ========== LCD I2C ==========
+// Fingerprint AS608 (UART2)
+// RX2=16, TX2=17
+
+// Relay Solenoid
+#define RELAY_PIN  13
+
+// Komunikasi ke ESP32-CAM (UART1)
+#define CAM_RX_PIN 14   // terima dari TX ESP32-CAM
+#define CAM_TX_PIN 12   // kirim ke RX ESP32-CAM
+
+// ============================================================
+// MQTT TOPICS
+// ============================================================
+// SUBSCRIBE (terima perintah dari server/python)
+#define TOPIC_KUNCI      "brankas/kunci"       // UNLOCK / LOCK / SCAN
+#define TOPIC_CAM_RESULT "brankas/wajah/result"// WAJAH_OK / WAJAH_FAIL (diteruskan dari python)
+
+// PUBLISH (kirim status ke server/python)
+#define TOPIC_RFID       "brankas/rfid"        // UID kartu yang di-tap
+#define TOPIC_FINGER     "brankas/sidikjari"   // MATCH / FAIL / ID:<n>
+#define TOPIC_RELAY      "brankas/relay"       // OPEN / CLOSED
+#define TOPIC_STATUS     "brankas/status"      // status autentikasi keseluruhan
+#define TOPIC_LOG        "brankas/log"         // log teks untuk debugging
+
+// ============================================================
+// DATA AUTENTIKASI (GANTI DENGAN DATA ASLI)
+// ============================================================
+const uint32_t AUTHORIZED_RFID_UID = 0x5909D006; // baca UID dulu via serial monitor
+const int      AUTHORIZED_FINGER_ID = 1;          // ID sidik jari yang di-enrolwwl
+
+// ============================================================
+// OBJEK
+// ============================================================
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// ========== FINGERPRINT (UART2: RX=16, TX=17) ==========
-HardwareSerial mySerial(2);
-Adafruit_Fingerprint finger(&mySerial);
+HardwareSerial fingerSerial(2);   // UART2: RX=16, TX=17
+Adafruit_Fingerprint finger(&fingerSerial);
 
-// ========== RFID RC522 (SPI) ==========
-#define RST_PIN  4
-#define SS_PIN   5
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 
-// ========== RELAY ==========
-#define RELAY_PIN 13
+HardwareSerial camSerial(1);      // UART1: RX=14, TX=12
 
-// ========== WEBSERVER ==========
-WebServer serverHTTP(80);
-
-// ========== MQTT CLIENT ==========
-WiFiClientSecure espClient;
+WiFiClient   espClient;
 PubSubClient client(espClient);
 
-// ========== VARIABEL AUTH ==========
-bool brankasTerbuka = false;
-bool wajahOK        = false;
-bool sidikOK        = false;
-bool rfidOK         = false;
+// ============================================================
+// VARIABEL STATE AUTENTIKASI
+// ============================================================
+bool authWajah  = false;
+bool authSidik  = false;
+bool authRFID   = false;
 
-int  gagalCount     = 0;
-const int MAX_GAGAL = 5;
+unsigned long authStartTime = 0;
+const unsigned long AUTH_TIMEOUT_MS = 60000; // 60 detik untuk selesaikan 3 auth
 
-unsigned long authStartTime;
-const unsigned long AUTH_TIMEOUT = 30000;
-
-// ========== MODE ENROLL ==========
-bool enrollMode = false;
-int  enrollID   = -1;
-
-// ========== DATA TERDAFTAR ==========
-const uint32_t authorizedRFID = 0x5909D006;
-
-// ========== DEKLARASI FUNGSI ==========
-void updateLCD();
-void publishStatus(const char* status);
-void connectMQTT();
-void checkAllAuth();
-void resetAuth();
-void checkFingerprint();
-void checkRFID();
-void tampilLockout();
-void doEnroll(int id);
-void triggerCamScan();
-
-// ===================================================
-// LCD
-// ===================================================
-void updateLCD() {
-  lcd.clear();
-  if (enrollMode) {
-    lcd.setCursor(0, 0);
-    lcd.print("Mode Enroll ID:");
-    lcd.setCursor(0, 1);
-    lcd.print(enrollID);
-    return;
-  }
-  if (brankasTerbuka) {
-    lcd.setCursor(0, 0);
-    lcd.print("Berangkas Terbuka");
-    lcd.setCursor(0, 1);
-    lcd.print("Selamat Datang! ");
-  } else {
-    lcd.setCursor(0, 0);
-    if (!rfidOK) {
-      lcd.print("Tempelkan Kartu ");
-      lcd.setCursor(0, 1);
-      lcd.print("                ");
-    } else if (!sidikOK) {
-      lcd.print("Tempel Sidik");
-      lcd.setCursor(0, 1);
-      lcd.print("Jari Anda       ");
-    } else if (!wajahOK) {
-      lcd.print("Scan Wajah");
-      lcd.setCursor(0, 1);
-      lcd.print("Lihat ke Kamera ");
-    }
-  }
-}
-
-// ===================================================
-// LOCKOUT
-// ===================================================
-void tampilLockout() {
+// ============================================================
+// HELPER: LCD + LOG
+// ============================================================
+void lcdPrint(const char* baris1, const char* baris2 = "") {
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("AKSES DIKUNCI!");
+  lcd.print(baris1);
   lcd.setCursor(0, 1);
-  lcd.print("Hubungi Admin   ");
-  publishStatus("lockout");
-  Serial.println("[AUTH] LOCKOUT! 5x gagal");
-  delay(30000);
-  gagalCount = 0;
-  resetAuth();
-  updateLCD();
+  lcd.print(baris2);
 }
 
-// ===================================================
-// TRIGGER ESP32-CAM
-// ===================================================
-void triggerCamScan() {
-  Serial.println("[CAM] Trigger scan wajah...");
-
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Menghubungi");
-  lcd.setCursor(0, 1);
-  lcd.print("Kamera...       ");
-
-  HTTPClient http;
-  String url = "http://" + String(camIP) + ":" + String(camPort) + "/trigger_scan";
-  http.begin(url);
-  http.setTimeout(5000);
-
-  int code = http.GET();
-  http.end();
-
-  if (code == 200) {
-    Serial.println("[CAM] Trigger OK, tunggu hasil...");
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Scan Wajah");
-    lcd.setCursor(0, 1);
-    lcd.print("Lihat ke Kamera ");
-  } else {
-    Serial.println("[CAM] Gagal! Code: " + String(code));
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Kamera Error!");
-    lcd.setCursor(0, 1);
-    lcd.print("Cek koneksi     ");
-    delay(2000);
-    gagalCount++;
-    if (gagalCount >= MAX_GAGAL) tampilLockout();
-    else updateLCD();
+void mqttLog(const char* msg) {
+  Serial.println(msg);
+  if (client.connected()) {
+    client.publish(TOPIC_LOG, msg);
   }
 }
 
-// ===================================================
-// HANDLER HTTP DARI ESP32-CAM
-// ===================================================
-void handleOpen() {
-  String name = serverHTTP.arg("name");
-  Serial.println("[HTTP] /open diterima, nama: " + name);
-
-  if (!rfidOK || !sidikOK) {
-    Serial.println("[HTTP] /open ditolak - auth belum lengkap");
-    serverHTTP.send(403, "text/plain", "AUTH_INCOMPLETE");
-    return;
-  }
-
-  wajahOK = true;
-
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Halo,");
-  lcd.setCursor(0, 1);
-  lcd.print(name.substring(0, 10) + " \x7E");
-  delay(2000);
-
-  serverHTTP.send(200, "text/plain", "OK");
-  checkAllAuth();
+void standbyLCD() {
+  char baris2[17] = "";
+  snprintf(baris2, sizeof(baris2), "W:%d F:%d R:%d",
+           authWajah ? 1 : 0,
+           authSidik ? 1 : 0,
+           authRFID  ? 1 : 0);
+  lcdPrint("== SENTINEL ==", baris2);
 }
 
-void handleDeny() {
-  Serial.println("[HTTP] /deny diterima");
-
-  gagalCount++;
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Wajah Ditolak!");
-  lcd.setCursor(0, 1);
-  lcd.print("Gagal: " + String(gagalCount) + "/" + String(MAX_GAGAL));
-  delay(2000);
-
-  serverHTTP.send(200, "text/plain", "DENIED");
-
-  if (gagalCount >= MAX_GAGAL) tampilLockout();
-  else updateLCD();
+// ============================================================
+// RELAY CONTROL
+// ============================================================
+void relayBuka() {
+  digitalWrite(RELAY_PIN, HIGH);
+  client.publish(TOPIC_RELAY, "OPEN");
+  mqttLog("[RELAY] BUKA - solenoid aktif");
 }
 
-// ===================================================
-// MQTT
-// ===================================================
-void publishStatus(const char* status) {
-  client.publish("brankas/status", status);
-  Serial.print("[MQTT] Status: ");
-  Serial.println(status);
+void relayKunci() {
+  digitalWrite(RELAY_PIN, LOW);
+  client.publish(TOPIC_RELAY, "CLOSED");
+  mqttLog("[RELAY] KUNCI - solenoid nonaktif");
 }
 
-void callback(char* topic, byte* payload, unsigned int length) {
-  String message = "";
-  for (unsigned int i = 0; i < length; i++) message += (char)payload[i];
-
-  Serial.print("[MQTT] [");
-  Serial.print(topic);
-  Serial.print("]: ");
-  Serial.println(message);
-
-  if (String(topic) == "brankas/kunci") {
-    if (message == "UNLOCK") {
-      brankasTerbuka = true;
-      digitalWrite(RELAY_PIN, HIGH);
-      updateLCD();
-      publishStatus("terbuka");
-    } else if (message == "LOCK") {
-      brankasTerbuka = false;
-      digitalWrite(RELAY_PIN, LOW);
-      gagalCount = 0;
-      resetAuth();
-      updateLCD();
-      publishStatus("terkunci");
-    } else {
-      publishStatus("error");
-    }
-  }
-
-  if (String(topic) == "brankas/sidik/enroll") {
-    int id = message.toInt();
-    if (id >= 1 && id <= 127) {
-      enrollMode = true;
-      enrollID   = id;
-      Serial.print("[ENROLL] Mulai enroll ID: ");
-      Serial.println(id);
-      updateLCD();
-      doEnroll(id);
-    } else {
-      client.publish("brankas/sidik/result", "ERROR:ID_INVALID");
-    }
-  }
-
-  if (String(topic) == "brankas/sidik/hapus") {
-    int id = message.toInt();
-    if (id >= 1 && id <= 127) {
-      uint8_t p = finger.deleteModel(id);
-      if (p == FINGERPRINT_OK)
-        client.publish("brankas/sidik/result", ("DELETED:" + String(id)).c_str());
-      else
-        client.publish("brankas/sidik/result", ("DELETE_FAIL:" + String(id)).c_str());
-    }
-  }
-}
-
-void connectMQTT() {
-  while (!client.connected()) {
-    Serial.print("[MQTT] Connecting...");
-    String clientId = "ESP32-" + WiFi.macAddress();
-    clientId.replace(":", "");
-    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
-      Serial.println("Connected!");
-      client.subscribe("brankas/kunci");
-      client.subscribe("brankas/sidik/enroll");
-      client.subscribe("brankas/sidik/hapus");
-      publishStatus("online");
-    } else {
-      Serial.print("Gagal rc=");
-      Serial.print(client.state());
-      Serial.println(" | Retry 5s...");
-      delay(5000);
-    }
-  }
-}
-
-// ===================================================
-// ENROLL
-// ===================================================
-void doEnroll(int id) {
-  int p = -1;
-
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Tempel Jari #1");
-  lcd.setCursor(0, 1);
-  lcd.print("ID: " + String(id));
-  client.publish("brankas/sidik/result", ("ENROLL_STEP1:" + String(id)).c_str());
-
-  unsigned long t = millis();
-  while (p != FINGERPRINT_OK) {
-    if (millis() - t > 15000) {
-      client.publish("brankas/sidik/result", "ERROR:TIMEOUT");
-      lcd.clear(); lcd.setCursor(0,0); lcd.print("Enroll Timeout!");
-      delay(2000); enrollMode = false; updateLCD(); return;
-    }
-    p = finger.getImage();
-    client.loop();
-  }
-
-  p = finger.image2Tz(1);
-  if (p != FINGERPRINT_OK) {
-    client.publish("brankas/sidik/result", "ERROR:IMAGE1_FAIL");
-    enrollMode = false; updateLCD(); return;
-  }
-
-  lcd.clear(); lcd.setCursor(0,0); lcd.print("Angkat Jari...");
-  delay(2000);
-  while (finger.getImage() != FINGERPRINT_NOFINGER) { client.loop(); }
-
-  lcd.clear();
-  lcd.setCursor(0, 0); lcd.print("Tempel Lagi");
-  lcd.setCursor(0, 1); lcd.print("Jari yang Sama");
-  client.publish("brankas/sidik/result", ("ENROLL_STEP2:" + String(id)).c_str());
-
-  p = -1; t = millis();
-  while (p != FINGERPRINT_OK) {
-    if (millis() - t > 15000) {
-      client.publish("brankas/sidik/result", "ERROR:TIMEOUT");
-      lcd.clear(); lcd.setCursor(0,0); lcd.print("Enroll Timeout!");
-      delay(2000); enrollMode = false; updateLCD(); return;
-    }
-    p = finger.getImage();
-    client.loop();
-  }
-
-  p = finger.image2Tz(2);
-  if (p != FINGERPRINT_OK) {
-    client.publish("brankas/sidik/result", "ERROR:IMAGE2_FAIL");
-    enrollMode = false; updateLCD(); return;
-  }
-
-  p = finger.createModel();
-  if (p == FINGERPRINT_ENROLLMISMATCH) {
-    lcd.clear(); lcd.setCursor(0,0); lcd.print("Jari Tidak");
-    lcd.setCursor(0,1); lcd.print("Cocok! Ulangi");
-    client.publish("brankas/sidik/result", "ERROR:MISMATCH");
-    delay(2000); enrollMode = false; updateLCD(); return;
-  }
-
-  p = finger.storeModel(id);
-  if (p == FINGERPRINT_OK) {
-    lcd.clear();
-    lcd.setCursor(0,0); lcd.print("Enroll Berhasil!");
-    lcd.setCursor(0,1); lcd.print("ID: " + String(id) + " \x7E");
-    client.publish("brankas/sidik/result", ("SUCCESS:" + String(id)).c_str());
-    delay(3000);
-  } else {
-    client.publish("brankas/sidik/result", "ERROR:STORE_FAIL");
-  }
-
-  enrollMode = false;
-  updateLCD();
-}
-
-// ===================================================
-// AUTH
-// ===================================================
+// ============================================================
+// CEK SEMUA AUTENTIKASI
+// ============================================================
 void resetAuth() {
-  wajahOK = sidikOK = rfidOK = false;
+  authWajah  = false;
+  authSidik  = false;
+  authRFID   = false;
   authStartTime = millis();
+  client.publish(TOPIC_STATUS, "RESET");
+  standbyLCD();
 }
 
-void checkAllAuth() {
-  if (rfidOK && sidikOK && wajahOK) {
-    lcd.clear();
-    lcd.setCursor(0,0); lcd.print("R:\x7E S:\x7E W:\x7E");
-    lcd.setCursor(0,1); lcd.print("Verifikasi OK!");
-    delay(3000);
+void cekSemuaAuth() {
+  // Publish status progress
+  char statusMsg[64];
+  snprintf(statusMsg, sizeof(statusMsg),
+           "{\"wajah\":%d,\"sidik\":%d,\"rfid\":%d}",
+           authWajah ? 1 : 0,
+           authSidik ? 1 : 0,
+           authRFID  ? 1 : 0);
+  client.publish(TOPIC_STATUS, statusMsg);
 
-    lcd.clear();
-    lcd.setCursor(0,0); lcd.print("Akses Diterima!");
-    lcd.setCursor(0,1); lcd.print("Membuka...      ");
-    delay(1000);
+  if (authWajah && authSidik && authRFID) {
+    // ====== SEMUA AUTH LULUS ======
+    lcdPrint("AKSES DITERIMA", "Membuka...");
+    client.publish(TOPIC_STATUS, "GRANTED");
+    mqttLog("[AUTH] SEMUA LULUS - membuka brankas");
 
-    brankasTerbuka = true;
-    digitalWrite(RELAY_PIN, HIGH);
-    publishStatus("terbuka");
+    relayBuka();
+    delay(5000);  // solenoid aktif 5 detik
+    relayKunci();
 
-    lcd.clear();
-    lcd.setCursor(0,0); lcd.print("Pintu Terbuka");
-    lcd.setCursor(0,1); lcd.print("Tunggu 5 detik..");
-    delay(5000);
-
-    digitalWrite(RELAY_PIN, LOW);
-    brankasTerbuka = false;
-    gagalCount = 0;
-    publishStatus("terkunci");
-    resetAuth();
-    updateLCD();
-  } else {
-    updateLCD();
-  }
-}
-
-// ===================================================
-// RFID
-// ===================================================
-void checkRFID() {
-  if (rfidOK) return;
-  if (!mfrc522.PICC_IsNewCardPresent()) return;
-  if (!mfrc522.PICC_ReadCardSerial()) return;
-
-  uint32_t uid = 0;
-  for (byte i = 0; i < mfrc522.uid.size; i++)
-    uid = (uid << 8) | mfrc522.uid.uidByte[i];
-
-  Serial.print("[RFID] UID: 0x");
-  Serial.println(uid, HEX);
-
-  if (uid == authorizedRFID) {
-    rfidOK = true;
-    lcd.clear();
-    lcd.setCursor(0,0); lcd.print("Kartu RFID");
-    lcd.setCursor(0,1); lcd.print("Berhasil \x7E");
-    delay(3000);
-    checkAllAuth();
-  } else {
-    gagalCount++;
-    lcd.clear();
-    lcd.setCursor(0,0); lcd.print("Kartu Ditolak!");
-    lcd.setCursor(0,1); lcd.print("Gagal: " + String(gagalCount) + "/" + String(MAX_GAGAL));
+    lcdPrint("Brankas ditutup", "Auth direset");
     delay(2000);
-    if (gagalCount >= MAX_GAGAL) tampilLockout();
-    else updateLCD();
-  }
+    resetAuth();
 
-  mfrc522.PICC_HaltA();
-  mfrc522.PCD_StopCrypto1();
+  } else {
+    // Tampilkan progress
+    standbyLCD();
+  }
 }
 
-// ===================================================
+// ============================================================
 // FINGERPRINT
-// ===================================================
+// ============================================================
 void checkFingerprint() {
-  if (sidikOK || !rfidOK) return;
+  if (authSidik) return;  // sudah OK, skip
 
   int result = finger.getImage();
+  if (result == FINGERPRINT_NOFINGER) return;
   if (result != FINGERPRINT_OK) return;
 
   result = finger.image2Tz();
@@ -461,111 +186,285 @@ void checkFingerprint() {
 
   result = finger.fingerFastSearch();
   if (result != FINGERPRINT_OK) {
-    gagalCount++;
-    lcd.clear();
-    lcd.setCursor(0,0); lcd.print("Sidik Ditolak!");
-    lcd.setCursor(0,1); lcd.print("Gagal: " + String(gagalCount) + "/" + String(MAX_GAGAL));
-    delay(2000);
-    if (gagalCount >= MAX_GAGAL) tampilLockout();
-    else updateLCD();
+    // Tidak dikenali
+    lcdPrint("Sidik Salah!", "Coba lagi");
+    client.publish(TOPIC_FINGER, "FAIL");
+    mqttLog("[FINGER] Sidik jari tidak dikenali");
+    delay(1500);
+    standbyLCD();
     return;
   }
 
-  sidikOK = true;
-  Serial.println("[AUTH] Sidik jari OK, ID: " + String(finger.fingerID));
-  lcd.clear();
-  lcd.setCursor(0,0); lcd.print("Sidik Jari");
-  lcd.setCursor(0,1); lcd.print("Berhasil \x7E");
-  delay(2000);
+  // Dikenali - cek ID
+  char fingerMsg[32];
+  snprintf(fingerMsg, sizeof(fingerMsg), "MATCH:ID%d", finger.fingerID);
+  client.publish(TOPIC_FINGER, fingerMsg);
 
-  // Otomatis trigger scan wajah ke ESP32-CAM
-  triggerCamScan();
+  if (finger.fingerID == AUTHORIZED_FINGER_ID) {
+    authSidik = true;
+    lcdPrint("Sidik Cocok!", "");
+    mqttLog("[FINGER] Sidik jari OK");
+    delay(1200);
+    cekSemuaAuth();
+  } else {
+    lcdPrint("Sidik Tdk", "Terdaftar");
+    mqttLog("[FINGER] Sidik jari ID tidak diotorisasi");
+    delay(1500);
+    standbyLCD();
+  }
 }
 
-// ===================================================
+// ============================================================
+// RFID
+// ============================================================
+void checkRFID() {
+  if (authRFID) return;  // sudah OK, skip
+
+  if (!mfrc522.PICC_IsNewCardPresent()) return;
+  if (!mfrc522.PICC_ReadCardSerial())  return;
+
+  // Susun UID jadi uint32
+  uint32_t uid = 0;
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    uid = (uid << 8) | mfrc522.uid.uidByte[i];
+  }
+
+  // Publish UID ke MQTT
+  char uidStr[32];
+  snprintf(uidStr, sizeof(uidStr), "0x%08X", uid);
+  client.publish(TOPIC_RFID, uidStr);
+
+  Serial.print("[RFID] UID: ");
+  Serial.println(uidStr);
+
+  if (uid == AUTHORIZED_RFID_UID) {
+    authRFID = true;
+    lcdPrint("Kartu Cocok!", "");
+    mqttLog("[RFID] Kartu RFID OK");
+    delay(1200);
+    cekSemuaAuth();
+  } else {
+    lcdPrint("Kartu Salah!", "Ditolak");
+    mqttLog("[RFID] Kartu tidak diotorisasi");
+    delay(1500);
+    standbyLCD();
+  }
+
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+}
+
+// ============================================================
+// BACA PESAN DARI ESP32-CAM (via UART)
+// ============================================================
+void checkCamSerial() {
+  while (camSerial.available()) {
+    String msg = camSerial.readStringUntil('\n');
+    msg.trim();
+    if (msg.length() == 0) continue;
+
+    Serial.print("[CAM-UART] ");
+    Serial.println(msg);
+
+    if (msg == "WAJAH_OK" && !authWajah) {
+      authWajah = true;
+      lcdPrint("Wajah Cocok!", "");
+      // Forward ke MQTT agar python/dashboard tahu
+      client.publish("brankas/wajah/result", "WAJAH_OK");
+      mqttLog("[CAM] Wajah terverifikasi OK");
+      delay(1200);
+      cekSemuaAuth();
+
+    } else if (msg == "WAJAH_FAIL") {
+      lcdPrint("Wajah Gagal!", "Coba lagi");
+      client.publish("brankas/wajah/result", "WAJAH_FAIL");
+      mqttLog("[CAM] Wajah gagal dikenali");
+      delay(1500);
+      standbyLCD();
+    }
+  }
+}
+
+// ============================================================
+// MQTT CALLBACK (terima perintah dari Python/Dashboard)
+// ============================================================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg = "";
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+
+  Serial.print("[MQTT IN] ");
+  Serial.print(topic);
+  Serial.print(" -> ");
+  Serial.println(msg);
+
+  // ---- Topic: brankas/kunci ----
+  if (String(topic) == TOPIC_KUNCI) {
+
+    if (msg == "UNLOCK") {
+      // Override manual dari dashboard
+      lcdPrint("UNLOCK MANUAL", "Dari Dashboard");
+      relayBuka();
+      delay(5000);
+      relayKunci();
+      resetAuth();
+
+    } else if (msg == "LOCK") {
+      relayKunci();
+      lcdPrint("TERKUNCI", "Manual LOCK");
+      delay(2000);
+      resetAuth();
+
+    } else if (msg == "SCAN") {
+      // Minta ESP32-CAM untuk scan
+      camSerial.println("SCAN");
+      lcdPrint("Scan Wajah...", "Hadap kamera");
+      mqttLog("[KUNCI] Perintah SCAN dikirim ke CAM");
+
+    } else if (msg == "RESET") {
+      resetAuth();
+      mqttLog("[KUNCI] Auth direset oleh server");
+    }
+  }
+
+  // ---- Topic: brankas/wajah/result (dari Python face recognition) ----
+  if (String(topic) == TOPIC_CAM_RESULT) {
+    if (msg == "WAJAH_OK" && !authWajah) {
+      authWajah = true;
+      lcdPrint("Wajah OK!", "(via MQTT)");
+      mqttLog("[AUTH] Wajah OK via MQTT");
+      delay(1200);
+      cekSemuaAuth();
+    } else if (msg == "WAJAH_FAIL") {
+      lcdPrint("Wajah Gagal!", "(via MQTT)");
+      delay(1500);
+      standbyLCD();
+    }
+  }
+}
+
+// ============================================================
+// CONNECT MQTT
+// ============================================================
+void connectMQTT() {
+  while (!client.connected()) {
+    Serial.print("[MQTT] Connecting...");
+    String clientId = "SENTINEL-" + WiFi.macAddress();
+    clientId.replace(":", "");
+
+    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+      Serial.println("CONNECTED");
+      client.subscribe(TOPIC_KUNCI);
+      client.subscribe(TOPIC_CAM_RESULT);
+      client.publish(TOPIC_LOG, "ESP32 Utama online");
+    } else {
+      Serial.print("FAILED rc=");
+      Serial.println(client.state());
+      delay(3000);
+    }
+  }
+}
+
+// ============================================================
+// TIMEOUT AUTH
+// ============================================================
+void cekTimeout() {
+  if ((authWajah || authSidik || authRFID) &&
+      (millis() - authStartTime > AUTH_TIMEOUT_MS)) {
+    lcdPrint("TIMEOUT!", "Auth direset");
+    client.publish(TOPIC_STATUS, "TIMEOUT");
+    mqttLog("[AUTH] Timeout - auth direset");
+    delay(2000);
+    resetAuth();
+  }
+}
+
+// ============================================================
 // SETUP
-// ===================================================
+// ============================================================
 void setup() {
   Serial.begin(115200);
 
+  // Relay
+  pinMode(RELAY_PIN, OUTPUT);
+  relayKunci();
+
+  // LCD
   lcd.init();
   lcd.backlight();
-  lcd.setCursor(0,0); lcd.print("Sentinel Box");
-  lcd.setCursor(0,1); lcd.print("Booting...");
+  lcdPrint("SENTINEL BOX", "Booting...");
+
+  // WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("[WiFi] Connecting");
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 30) {
+    delay(500);
+    Serial.print(".");
+    retry++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] Connected: " + WiFi.localIP().toString());
+    lcdPrint("WiFi OK", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("\n[WiFi] GAGAL - lanjut tanpa WiFi");
+    lcdPrint("WiFi GAGAL", "Mode Offline");
+  }
   delay(1000);
 
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
-
-  WiFi.begin(ssid, password);
-  lcd.clear();
-  lcd.setCursor(0,0); lcd.print("Connecting WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    lcd.setCursor(0,1); lcd.print("Please wait...  ");
-  }
-  lcd.clear();
-  lcd.setCursor(0,0); lcd.print("WiFi Connected!");
-  lcd.setCursor(0,1); lcd.print(WiFi.localIP().toString());
-  Serial.println("[WiFi] IP: " + WiFi.localIP().toString());
-  delay(1500);
-
-  espClient.setInsecure();
+  // MQTT
   client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(callback);
+  client.setCallback(mqttCallback);
 
-  mySerial.begin(57600, SERIAL_8N1, 16, 17);
+  // Fingerprint AS608
+  fingerSerial.begin(57600, SERIAL_8N1, 16, 17);  // RX=16, TX=17
   finger.begin(57600);
-  lcd.clear();
+  delay(500);
   if (finger.verifyPassword()) {
-    lcd.setCursor(0,0); lcd.print("Finger Sensor");
-    lcd.setCursor(0,1); lcd.print("OK!");
+    Serial.println("[FINGER] Sensor OK");
+    lcdPrint("Finger OK", "");
   } else {
-    lcd.setCursor(0,0); lcd.print("Finger ERROR!");
-    lcd.setCursor(0,1); lcd.print("Cek kabel");
+    Serial.println("[FINGER] Sensor ERROR!");
+    lcdPrint("Finger ERROR!", "Cek kabel");
   }
-  delay(1500);
+  delay(1000);
 
+  // RFID RC522
   SPI.begin();
   mfrc522.PCD_Init();
-  lcd.clear();
-  lcd.setCursor(0,0); lcd.print("RFID Siap");
-  delay(1000);
+  Serial.println("[RFID] RC522 siap");
+  lcdPrint("RFID OK", "");
+  delay(500);
 
-  // HTTP server untuk terima hasil dari ESP32-CAM
-  serverHTTP.on("/open", handleOpen);
-  serverHTTP.on("/deny", handleDeny);
-  serverHTTP.begin();
-  Serial.println("[HTTP] Server jalan di port 80");
+  // UART ke ESP32-CAM
+  camSerial.begin(115200, SERIAL_8N1, CAM_RX_PIN, CAM_TX_PIN);
+  Serial.println("[CAM] UART ke ESP32-CAM siap");
 
-  gagalCount = 0;
-  resetAuth();
-  updateLCD();
-  Serial.println("[SYSTEM] Sistem siap!");
+  authStartTime = millis();
+  standbyLCD();
+  Serial.println("[SENTINEL] Sistem siap!");
 }
 
-// ===================================================
+// ============================================================
 // LOOP
-// ===================================================
+// ============================================================
 void loop() {
-  if (!client.connected()) connectMQTT();
+  // Reconnect MQTT jika putus
+  if (!client.connected()) {
+    connectMQTT();
+  }
   client.loop();
 
-  serverHTTP.handleClient(); // terima HTTP dari ESP32-CAM
+  // Baca pesan dari ESP32-CAM via UART
+  checkCamSerial();
 
-  if (enrollMode) return;
+  // Cek sensor RFID
+  checkRFID();
 
-  if (!rfidOK)             checkRFID();
-  if (rfidOK && !sidikOK) checkFingerprint();
+  // Cek sensor sidik jari
+  checkFingerprint();
 
-  // Timeout auth
-  if (millis() - authStartTime > AUTH_TIMEOUT && (rfidOK || sidikOK)) {
-    Serial.println("[AUTH] Timeout! Reset.");
-    lcd.clear();
-    lcd.setCursor(0,0); lcd.print("Timeout!");
-    lcd.setCursor(0,1); lcd.print("Ulangi proses   ");
-    delay(1500);
-    resetAuth();
-    updateLCD();
-  }
+  // Cek timeout autentikasi
+  cekTimeout();
 }
