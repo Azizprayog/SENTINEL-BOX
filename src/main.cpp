@@ -53,6 +53,9 @@ enum StepAuth {
 };
 
 StepAuth currentStep = WAIT_RFID;
+bool isEnrolling = false; 
+int enrollStep = 0;
+int enrollID = 1;
 
 int failCount = 0;
 const int MAX_FAIL = 5;
@@ -102,6 +105,7 @@ void handleFail(const char* msg){
 
 // ================= RFID =================
 void checkRFID() {
+  if (isEnrolling) return;
   if (currentStep != WAIT_RFID) return;
 
   if (!mfrc522.PICC_IsNewCardPresent()) return;
@@ -131,27 +135,78 @@ void checkRFID() {
 
 // ================= FINGER =================
 void checkFingerprint() {
+  if (isEnrolling) {
+
+    // STEP 1
+    if (enrollStep == 0) {
+        lcdPrint("Tempel Jari", "Langkah 1");
+      if (finger.getImage()!=FINGERPRINT_OK) return;
+      if (finger.image2Tz(1)!=FINGERPRINT_OK) return;
+        client.publish(TOPIC_FINGER, "ENROLL_STEP1");
+        lcdPrint("Angkat Jari", "");
+      delay(2000);
+
+      enrollStep = 1;
+      return;
+    }
+
+    // STEP 2
+    if (enrollStep == 1) {
+      lcdPrint("Tempel Lagi", "Langkah 2");
+
+      if (finger.getImage()!=FINGERPRINT_OK) return;
+      if (finger.image2Tz(2)!=FINGERPRINT_OK) return;
+
+      // buat model
+      if (finger.createModel()!=FINGERPRINT_OK) {
+        client.publish(TOPIC_FINGER, "ERROR");
+        isEnrolling = false;
+        enrollStep = 0;
+        return;
+      }
+
+      // simpan ke slot
+      if (finger.storeModel(enrollID)!=FINGERPRINT_OK) {
+        client.publish(TOPIC_FINGER, "ERROR");
+        isEnrolling = false;
+        enrollStep = 0;
+        return;
+      }
+
+      client.publish(TOPIC_FINGER, "SUCCESS");
+
+      lcdPrint("Berhasil", ("ID: " + String(enrollID)).c_str());
+      delay(3000);
+
+      isEnrolling = false;
+      enrollStep = 0;
+      resetSystem();
+      return;
+    }
+  }
+
+  // ================= NORMAL MODE =================
   if (currentStep != WAIT_FINGER) return;
-
+    client.publish(TOPIC_FINGER, "PROCESS");
   if (finger.getImage()!=FINGERPRINT_OK) return;
+    lcdPrint("Scan Sidik...","");
   if (finger.image2Tz()!=FINGERPRINT_OK) return;
-
   if (finger.fingerFastSearch()!=FINGERPRINT_OK) {
-    client.publish(TOPIC_FINGER, "FAIL"); // 🔥 TAMBAH
-    handleFail("Sidik Salah");
-    return;
+    client.publish(TOPIC_FINGER, "FAIL");
+      handleFail("Sidik Salah");
+      return;
   }
 
   if (finger.fingerID == AUTHORIZED_FINGER_ID) {
-    client.publish(TOPIC_FINGER, "MATCH"); // 🔥 TAMBAH
+    client.publish(TOPIC_FINGER, "MATCH");
 
-    lcdPrint("Sidik Berhasil","");
+    lcdPrint("Sidik OK","");
     delay(2000);
 
     currentStep = WAIT_FACE;
     lcdPrint("Hadap Kamera","");
   } else {
-    client.publish(TOPIC_FINGER, "UNKNOWN"); // 🔥 TAMBAH
+    client.publish(TOPIC_FINGER, "UNKNOWN");
     handleFail("Tidak Terdaftar");
   }
 }
@@ -204,6 +259,17 @@ void callback(char* topic, byte* payload, unsigned int length) {
     }
   }
 
+  if(String(topic)==TOPIC_ENROLL){
+  isEnrolling = true;
+  enrollStep = 0;
+  enrollID = msg.toInt(); // 🔥 ambil ID dari dashboard
+
+  lcdPrint("MODE ENROLL", ("ID: " + String(enrollID)).c_str());
+  delay(1500);
+
+  client.publish(TOPIC_FINGER, "PROCESS");
+}
+
   // 🔥 HASIL WAJAH
   if(String(topic)==TOPIC_CAM_RESULT){
     if(currentStep != WAIT_FACE) return;
@@ -234,6 +300,7 @@ void reconnect(){
       // 🔥 SUBSCRIBE SEMUA
       client.subscribe(TOPIC_CAM_RESULT);
       client.subscribe(TOPIC_KUNCI);
+      client.subscribe(TOPIC_ENROLL); 
 
       // 🔥 STATUS ONLINE
       client.publish(TOPIC_STATUS, "online");
