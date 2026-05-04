@@ -12,9 +12,9 @@
 
 #define USE_UART_CAM 0
 
-const char* ssid        = "SIJABAIK";
-const char* password    = "SENTINEL";
-const char* mqtt_server = "10.42.0.32";
+const char* ssid        = "Nell";
+const char* password    = "Dimasu(kin)";
+const char* mqtt_server = "192.168.1.10";
 const int   mqtt_port   = 1883;
 const char* mqtt_user   = "sentinel";
 const char* mqtt_pass   = "Tes12345";
@@ -25,13 +25,13 @@ const char* mqtt_pass   = "Tes12345";
 #define CAM_RX_PIN 14
 #define CAM_TX_PIN 12
 
+#define TOPIC_STATUS     "brankas/status"
 #define TOPIC_KUNCI      "brankas/kunci"
-#define TOPIC_CAM_RESULT "brankas/wajah/result"
 #define TOPIC_RFID       "brankas/rfid"
 #define TOPIC_FINGER     "brankas/sidikjari"
 #define TOPIC_ENROLL     "brankas/sidik/enroll"
+#define TOPIC_DELETE     "brankas/sidik/hapus"
 #define TOPIC_RELAY      "brankas/relay"
-#define TOPIC_STATUS     "brankas/status"
 
 const uint32_t AUTHORIZED_RFID_UID = 0x5909D006;
 const int AUTHORIZED_FINGER_ID = 1;
@@ -40,7 +40,6 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 HardwareSerial fingerSerial(2);
 Adafruit_Fingerprint finger(&fingerSerial);
 MFRC522 mfrc522(SS_PIN, RST_PIN);
-HardwareSerial camSerial(1);
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -49,7 +48,6 @@ PubSubClient client(espClient);
 enum StepAuth {
   WAIT_RFID,
   WAIT_FINGER,
-  WAIT_FACE
 };
 
 StepAuth currentStep = WAIT_RFID;
@@ -59,6 +57,7 @@ int enrollID = 1;
 
 int failCount = 0;
 const int MAX_FAIL = 5;
+bool sentProcess = false;
 
 // ================= LCD =================
 void lcdPrint(const char* a, const char* b="") {
@@ -81,6 +80,7 @@ void relayKunci() {
 // ================= RESET =================
 void resetSystem() {
   failCount = 0;
+  sentProcess = false;
   currentStep = WAIT_RFID;
   lcdPrint("Tempel Kartu","");
 }
@@ -111,25 +111,21 @@ void checkRFID() {
   if (!mfrc522.PICC_IsNewCardPresent()) return;
   if (!mfrc522.PICC_ReadCardSerial()) return;
 
-  uint32_t uid=0;
-  for(byte i=0;i<mfrc522.uid.size;i++)
-    uid=(uid<<8)|mfrc522.uid.uidByte[i];
+  uint32_t uid = 0;
+  for (byte i = 0; i < mfrc522.uid.size; i++)
+    uid = (uid << 8) | mfrc522.uid.uidByte[i];
 
-  client.publish(TOPIC_RFID, String(uid).c_str()); // 🔥 TAMBAH
-
-  if(uid==AUTHORIZED_RFID_UID){
-    client.publish(TOPIC_RFID, "VALID"); // 🔥 TAMBAH
-
-    lcdPrint("Kartu Berhasil","");
+  // ================= VALIDASI =================
+  if (uid == AUTHORIZED_RFID_UID) {
+    client.publish(TOPIC_RFID, String(uid).c_str());  // ✔ kirim UID saja
+    lcdPrint("Kartu Berhasil", "");
     delay(2000);
-
     currentStep = WAIT_FINGER;
-    lcdPrint("Tempel Jari","");
+    lcdPrint("Tempel Jari", "");
   } else {
-    client.publish(TOPIC_RFID, "INVALID"); // 🔥 TAMBAH
+    client.publish(TOPIC_RFID, "UNKNOWN");  // ✔ gagal
     handleFail("Kartu Salah");
   }
-
   mfrc522.PICC_HaltA();
 }
 
@@ -186,58 +182,43 @@ void checkFingerprint() {
   }
 
   // ================= NORMAL MODE =================
-  if (currentStep != WAIT_FINGER) return;
-    client.publish(TOPIC_FINGER, "PROCESS");
-  if (finger.getImage()!=FINGERPRINT_OK) return;
-    lcdPrint("Scan Sidik...","");
-  if (finger.image2Tz()!=FINGERPRINT_OK) return;
-  if (finger.fingerFastSearch()!=FINGERPRINT_OK) {
-    client.publish(TOPIC_FINGER, "FAIL");
-      handleFail("Sidik Salah");
-      return;
-  }
+    if (currentStep != WAIT_FINGER) return;
+      
+    if (!sentProcess) {
+      client.publish(TOPIC_FINGER, "PROCESS");
+      sentProcess = true;
+    }
 
-  if (finger.fingerID == AUTHORIZED_FINGER_ID) {
-    client.publish(TOPIC_FINGER, "MATCH");
+    if (finger.getImage()!=FINGERPRINT_OK) return;
+      lcdPrint("Scan Sidik...","");
 
-    lcdPrint("Sidik OK","");
-    delay(2000);
+    if (finger.image2Tz()!=FINGERPRINT_OK) return;
+    
+    if (finger.fingerFastSearch()!=FINGERPRINT_OK) {
+      client.publish(TOPIC_FINGER, "FAIL");
+      sentProcess = false;
+        handleFail("Sidik Salah");
+        return;
+    }
 
-    currentStep = WAIT_FACE;
-    lcdPrint("Hadap Kamera","");
-  } else {
-    client.publish(TOPIC_FINGER, "UNKNOWN");
-    handleFail("Tidak Terdaftar");
-  }
-}
+    if (finger.fingerID == AUTHORIZED_FINGER_ID) {
+      client.publish(TOPIC_FINGER, "MATCH");
+      sentProcess = false;
 
-// ================= CAM =================
-void checkCamUART() {
-
-  if (currentStep != WAIT_FACE) return;
-
-#if USE_UART_CAM
-  while (camSerial.available()) {
-    String msg = camSerial.readStringUntil('\n');
-    msg.trim();
-
-    if (msg == "WAJAH_OK") {
-      lcdPrint("Wajah Berhasil","");
-      delay(4000);
+      lcdPrint("Sidik OK","");
+      delay(2000);
 
       lcdPrint("AKSES DITERIMA","");
       relayBuka();
-      delay(5000);
+      delay(2000);
       relayKunci();
 
       resetSystem();
-    }
-
-    else if (msg == "WAJAH_FAIL") {
-      handleFail("Wajah Gagal");
-    }
+  } else {
+      client.publish(TOPIC_FINGER, "UNKNOWN");
+      sentProcess = false;
+      handleFail("Tidak Terdaftar");
   }
-#endif
 }
 
 // ================= MQTT =================
@@ -250,45 +231,41 @@ void callback(char* topic, byte* payload, unsigned int length) {
   Serial.print(" => ");
   Serial.println(msg);
 
-  // 🔥 CONTROL DARI DASHBOARD
+  // ================= KUNCI =================
   if(String(topic)==TOPIC_KUNCI){
     if(msg=="UNLOCK"){
       relayBuka();
-    } else if(msg=="LOCK"){
-      relayKunci();
+      delay(2000);  
+      lcdPrint("MODE MANUAL","");
     }
-  }
-
-  if(String(topic)==TOPIC_ENROLL){
-  isEnrolling = true;
-  enrollStep = 0;
-  enrollID = msg.toInt(); // 🔥 ambil ID dari dashboard
-
-  lcdPrint("MODE ENROLL", ("ID: " + String(enrollID)).c_str());
-  delay(1500);
-
-  client.publish(TOPIC_FINGER, "PROCESS");
-}
-
-  // 🔥 HASIL WAJAH
-  if(String(topic)==TOPIC_CAM_RESULT){
-    if(currentStep != WAIT_FACE) return;
-
-    if(msg=="WAJAH_OK"){
-      lcdPrint("Wajah Berhasil","");
-      delay(2000);
-
-      lcdPrint("AKSES DITERIMA","");
-      relayBuka();
-      delay(5000);
+    else if(msg=="LOCK"){
       relayKunci();
-
       resetSystem();
-    } else {
-      handleFail("Wajah Gagal");
     }
   }
-}
+
+  // ================= ENROLL =================
+  if(String(topic)==TOPIC_ENROLL){
+    isEnrolling = true;
+    enrollStep = 0;
+    enrollID = msg.toInt();
+
+    lcdPrint("MODE ENROLL", ("ID: " + String(enrollID)).c_str());
+    delay(1500);
+    client.publish(TOPIC_FINGER, "PROCESS");
+  }
+
+  // ================= DELETE SIDIK JARI =================
+  if(String(topic) == TOPIC_DELETE){
+      int id = msg.toInt();
+      if (finger.deleteModel(id) == FINGERPRINT_OK) {
+        Serial.println("Sidik jari dihapus");
+      } else {
+        Serial.println("Gagal hapus sidik jari");
+      }
+    }
+  }
+
 
 void reconnect(){
   while(!client.connected()){
@@ -298,9 +275,9 @@ void reconnect(){
       Serial.println("[MQTT] Connected");
 
       // 🔥 SUBSCRIBE SEMUA
-      client.subscribe(TOPIC_CAM_RESULT);
       client.subscribe(TOPIC_KUNCI);
       client.subscribe(TOPIC_ENROLL); 
+      client.subscribe(TOPIC_DELETE);
 
       // 🔥 STATUS ONLINE
       client.publish(TOPIC_STATUS, "online");
@@ -343,7 +320,6 @@ void setup() {
   SPI.begin();
   mfrc522.PCD_Init();
 
-  camSerial.begin(115200,SERIAL_8N1,CAM_RX_PIN,CAM_TX_PIN);
 
   resetSystem();
 
@@ -358,5 +334,4 @@ void loop() {
 
   checkRFID();
   checkFingerprint();
-  checkCamUART();
 }
