@@ -318,12 +318,15 @@ void callback(char* topic, byte* payload, unsigned int length) {
   // ================= KUNCI =================
   if(String(topic)==TOPIC_KUNCI){
     if(msg=="UNLOCK"){
+      lcdPrint("Membuka", "Brankas...");
       relayBuka();
-      delay(2000);  
-      lcdPrint("MODE MANUAL","");
-    }
-    else if(msg=="LOCK"){
+
+      delay(2000);
+
       relayKunci();
+      lcdPrint("Brankas", "Terkunci");
+      delay(1000);
+
       resetSystem();
     }
   }
