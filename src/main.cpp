@@ -12,9 +12,9 @@
 
 #define USE_UART_CAM 0
 
-const char* ssid        = "Nell";
-const char* password    = "Dimasu(kin)";
-const char* mqtt_server = "192.168.1.10";
+const char* ssid        = "R-403";
+const char* password    = "*ruang403";
+const char* mqtt_server = "10.4.3.101";
 const int   mqtt_port   = 1883;
 const char* mqtt_user   = "sentinel";
 const char* mqtt_pass   = "Tes12345";
@@ -34,7 +34,6 @@ const char* mqtt_pass   = "Tes12345";
 #define TOPIC_RELAY      "brankas/relay"
 
 const uint32_t AUTHORIZED_RFID_UID = 0x5909D006;
-const int AUTHORIZED_FINGER_ID = 1;
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 HardwareSerial fingerSerial(2);
@@ -55,7 +54,9 @@ bool isEnrolling = false;
 int enrollStep = 0;
 int enrollID = 1;
 
-int failCount = 0;
+int failRFID = 0;
+int failFinger = 0;
+
 const int MAX_FAIL = 5;
 bool sentProcess = false;
 
@@ -79,26 +80,9 @@ void relayKunci() {
 
 // ================= RESET =================
 void resetSystem() {
-  failCount = 0;
+  failRFID = 0;
+  failFinger = 0;
   sentProcess = false;
-  currentStep = WAIT_RFID;
-  lcdPrint("Tempel Kartu","");
-}
-
-// ================= FAIL =================
-void handleFail(const char* msg){
-  failCount++;
-
-  lcdPrint(msg,"Gagal");
-  delay(4000);
-
-  if(failCount >= MAX_FAIL){
-    lcdPrint("Akses Ditolak","");
-    delay(4000);
-    resetSystem();
-    return;
-  }
-
   currentStep = WAIT_RFID;
   lcdPrint("Tempel Kartu","");
 }
@@ -117,15 +101,35 @@ void checkRFID() {
 
   // ================= VALIDASI =================
   if (uid == AUTHORIZED_RFID_UID) {
-    client.publish(TOPIC_RFID, String(uid).c_str());  // ✔ kirim UID saja
+
+    // 🔥 RESET FAIL RFID kalau berhasil
+    failRFID = 0;
+
+    client.publish(TOPIC_RFID, String(uid).c_str());
     lcdPrint("Kartu Berhasil", "");
     delay(2000);
+
     currentStep = WAIT_FINGER;
-    lcdPrint("Tempel Jari", "");
+    failFinger = 0;
+    lcdPrint("Verifikasi", "Sidik Jari");
   } else {
-    client.publish(TOPIC_RFID, "UNKNOWN");  // ✔ gagal
-    handleFail("Kartu Salah");
+    client.publish(TOPIC_RFID, "UNKNOWN");
+
+    failRFID++;
+
+    lcdPrint("Kartu Salah", ("Try: " + String(failRFID)).c_str());
+    delay(2000);
+
+    if (failRFID >= MAX_FAIL) {
+      lcdPrint("Akses Ditolak","");
+      delay(3000);
+      resetSystem();   // balik ke awal
+    } else {
+      lcdPrint("Coba Lagi","");
+      // tetap di WAIT_RFID (ga perlu set ulang)
+    }
   }
+
   mfrc522.PICC_HaltA();
 }
 
@@ -141,7 +145,9 @@ void checkFingerprint() {
         client.publish(TOPIC_FINGER, "ENROLL_STEP1");
         lcdPrint("Angkat Jari", "");
       delay(2000);
-
+      while (finger.getImage() != FINGERPRINT_NOFINGER) {
+        delay(10);
+      }
       enrollStep = 1;
       return;
     }
@@ -150,15 +156,50 @@ void checkFingerprint() {
     if (enrollStep == 1) {
       lcdPrint("Tempel Lagi", "Langkah 2");
 
-      if (finger.getImage()!=FINGERPRINT_OK) return;
-      if (finger.image2Tz(2)!=FINGERPRINT_OK) return;
+      // tunggu sampai jari ditempel lagi
+      while (finger.getImage() != FINGERPRINT_OK) {
+        delay(10);
+      }
 
-      // buat model
-      if (finger.createModel()!=FINGERPRINT_OK) {
+      // convert image ke buffer 2
+      if (finger.image2Tz(2) != FINGERPRINT_OK) {
         client.publish(TOPIC_FINGER, "ERROR");
+
         isEnrolling = false;
         enrollStep = 0;
+
+        lcdPrint("Gagal Convert", "");
+        delay(2000);
+
+        resetSystem();
         return;
+      }
+
+      // cek apakah ID sudah ada
+      uint8_t check = finger.loadModel(enrollID);
+      if (check == FINGERPRINT_OK) {
+          lcdPrint("ID Sudah Ada", "");
+          client.publish(TOPIC_FINGER, "ID_EXISTS");
+
+          isEnrolling = false;
+          enrollStep = 0;
+          delay(2000);
+          resetSystem();
+          return;
+      }
+
+      // gabungkan buffer 1 & 2 jadi model fingerprint
+      if (finger.createModel() != FINGERPRINT_OK) {
+          client.publish(TOPIC_FINGER, "ERROR");
+
+          isEnrolling = false;
+          enrollStep = 0;
+
+          lcdPrint("Model Gagal", "");
+          delay(2000);
+
+          resetSystem();
+          return;
       }
 
       // simpan ke slot
@@ -190,35 +231,78 @@ void checkFingerprint() {
     }
 
     if (finger.getImage()!=FINGERPRINT_OK) return;
-      lcdPrint("Scan Sidik...","");
+
+      lcdPrint("Scan","Sidik jari");
 
     if (finger.image2Tz()!=FINGERPRINT_OK) return;
     
     if (finger.fingerFastSearch()!=FINGERPRINT_OK) {
       client.publish(TOPIC_FINGER, "FAIL");
-      sentProcess = false;
-        handleFail("Sidik Salah");
-        return;
-    }
+      failFinger++;
 
-    if (finger.fingerID == AUTHORIZED_FINGER_ID) {
-      client.publish(TOPIC_FINGER, "MATCH");
-      sentProcess = false;
-
-      lcdPrint("Sidik OK","");
+      // tampilkan jumlah percobaan
+      lcdPrint("Sidik Salah", ("Try: " + String(failFinger)).c_str());
       delay(2000);
 
-      lcdPrint("AKSES DITERIMA","");
+      // kalau belum 5x → tetap di fingerprint
+      if (failFinger < MAX_FAIL) {
+        lcdPrint("Coba Lagi Jari","");
+        delay(1000);
+        return;
+      }
+
+      // kalau sudah 5x → reset ke RFID
+      lcdPrint("Akses Ditolak","");
+      delay(3000);
+
+      resetSystem();
+      return;
+    }
+
+    // ================= SIDIK VALID =================
+    if (finger.fingerID >= 1 && finger.confidence > 50) {
+
+      Serial.print("Finger ID: ");
+      Serial.println(finger.fingerID);
+
+      Serial.print("Confidence: ");
+      Serial.println(finger.confidence);
+
+      String payload = "MATCH:" + String(finger.fingerID);
+      client.publish(TOPIC_FINGER, payload.c_str());
+      sentProcess = false;
+
+      // reset counter
+      failFinger = 0;
+      failRFID = 0;
+
+      lcdPrint("Sidik OK", ("ID: " + String(finger.fingerID)).c_str());
+      delay(2000);
+
+      lcdPrint("AKSES DITERIMA", "");
       relayBuka();
       delay(2000);
       relayKunci();
 
       resetSystem();
-  } else {
+    } else {
       client.publish(TOPIC_FINGER, "UNKNOWN");
       sentProcess = false;
-      handleFail("Tidak Terdaftar");
-  }
+
+      failFinger++;
+
+      lcdPrint("Sidik Tidak Cocok", ("Try: " + String(failFinger)).c_str());
+      delay(2000);
+
+      if (failFinger < MAX_FAIL) {
+        lcdPrint("Coba Lagi","");
+        return;
+      }
+
+      lcdPrint("Akses Ditolak","");
+      delay(3000);
+      resetSystem();
+    }
 }
 
 // ================= MQTT =================
@@ -250,7 +334,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     enrollStep = 0;
     enrollID = msg.toInt();
 
-    lcdPrint("MODE ENROLL", ("ID: " + String(enrollID)).c_str());
+    lcdPrint("Pendaftaran jari", ("ID: " + String(enrollID)).c_str());
     delay(1500);
     client.publish(TOPIC_FINGER, "PROCESS");
   }
@@ -308,7 +392,7 @@ void setup() {
   lcdPrint("WiFi OK","");
   delay(1000);
 
-  lcdPrint("IP:", WiFi.localIP().toString().c_str());
+  lcdPrint("WiFi Terhubung", WiFi.localIP().toString().c_str());
   delay(2000);
 
   client.setServer(mqtt_server,mqtt_port);
@@ -316,6 +400,18 @@ void setup() {
 
   fingerSerial.begin(57600,SERIAL_8N1,16,17);
   finger.begin(57600);
+
+  if (finger.verifyPassword()) {
+    Serial.println("Fingerprint sensor OK");
+  } else {
+    Serial.println("Fingerprint sensor ERROR");
+
+    lcdPrint("Sidik Jari", "Bermasalah");
+    
+    while (1) {
+      delay(1);
+    }
+  }
 
   SPI.begin();
   mfrc522.PCD_Init();
