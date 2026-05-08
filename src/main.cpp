@@ -12,9 +12,9 @@
 
 #define USE_UART_CAM 0
 
-const char* ssid        = "R-403";
-const char* password    = "*ruang403";
-const char* mqtt_server = "10.4.3.101";
+const char* ssid        = "R-408";
+const char* password    = "*ruang408";
+const char* mqtt_server = "10.4.0.160";
 const int   mqtt_port   = 1883;
 const char* mqtt_user   = "sentinel";
 const char* mqtt_pass   = "Tes12345";
@@ -70,12 +70,16 @@ void lcdPrint(const char* a, const char* b="") {
 // ================= RELAY =================
 void relayBuka() {
   digitalWrite(RELAY_PIN, HIGH);
+
   client.publish(TOPIC_RELAY, "OPEN");
+  client.publish(TOPIC_STATUS, "terbuka");
 }
 
 void relayKunci() {
   digitalWrite(RELAY_PIN, LOW);
+
   client.publish(TOPIC_RELAY, "CLOSED");
+  client.publish(TOPIC_STATUS, "terkunci");
 }
 
 // ================= RESET =================
@@ -281,7 +285,7 @@ void checkFingerprint() {
 
       lcdPrint("AKSES DITERIMA", "");
       relayBuka();
-      delay(2000);
+      delay(5000);
       relayKunci();
 
       resetSystem();
@@ -321,7 +325,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
       lcdPrint("Membuka", "Brankas...");
       relayBuka();
 
-      delay(2000);
+      delay(5000);
 
       relayKunci();
       lcdPrint("Brankas", "Terkunci");
@@ -361,13 +365,12 @@ void reconnect(){
     if(client.connect("SENTINEL",mqtt_user,mqtt_pass)){
       Serial.println("[MQTT] Connected");
 
-      // 🔥 SUBSCRIBE SEMUA
       client.subscribe(TOPIC_KUNCI);
       client.subscribe(TOPIC_ENROLL); 
       client.subscribe(TOPIC_DELETE);
 
-      // 🔥 STATUS ONLINE
-      client.publish(TOPIC_STATUS, "online");
+      // 🔥 KIRIM STATUS AWAL
+      client.publish(TOPIC_STATUS, "terkunci");
 
     } else {
       Serial.print("Failed rc=");
@@ -382,7 +385,7 @@ void setup() {
   Serial.begin(115200);
 
   pinMode(RELAY_PIN,OUTPUT);
-  relayKunci();
+  digitalWrite(RELAY_PIN, LOW);
 
   lcd.init(); lcd.backlight();
 
@@ -421,9 +424,6 @@ void setup() {
 
 
   resetSystem();
-
-  // 🔥 STATUS ONLINE
-  client.publish(TOPIC_STATUS, "booting");
 }
 
 // ================= LOOP =================
